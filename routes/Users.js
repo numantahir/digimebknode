@@ -3,7 +3,7 @@ const Users = express.Router();
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
-const db = require("../models");
+const supabase = require("../config/supabase");
 const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
 const { jwtDecode } = require("jwt-decode");
@@ -50,7 +50,11 @@ Users.post("/reset-password", async (req, res) => {
 
   try {
     // Find the user by email
-    const user = await User.findOne({ where: { email } });
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
     if (!user) {
       return res.status(404).json({
         status: false,
@@ -62,55 +66,54 @@ Users.post("/reset-password", async (req, res) => {
     const newPassword = generateRandomPassword();
 
     // Hash the new password before saving it to the database
-    bcrypt.hash(newPassword, 10, async (err, hashedPassword) => {
-      if (err) {
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update the user's password in the database
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update({ password: hashedPassword })
+      .eq('email', email)
+      .select()
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({
+        status: false,
+        message: "Error hashing the password",
+        error: updateError.message,
+      });
+    }
+
+    const mailOptions = {
+      from: `"DigiMe Support" <${emailConfig.gmail.user}>`, // Sender name & email
+      to: email, // Receiver email
+      subject: "DigiMe: Password Reset",
+      html: `
+        <div style="font-family: Arial, sans-serif; line-height: 1.6; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
+          <h2 style="color: #333;">Password Reset Request</h2>
+          <p>Hello,</p>
+          <p>We received a request to reset your password. Here is your new password:</p>
+          <p style="font-size: 18px; font-weight: bold; color: #007bff;">${newPassword}</p>
+          <p>Please log in and change your password immediately for security purposes.</p>
+          <p>If you did not request this change, please ignore this email or contact our support.</p>
+          <hr style="border: none; border-top: 1px solid #ddd;">
+          <p style="font-size: 12px; color: #888;">This is an automated email, please do not reply.</p>
+        </div>
+      `,
+    };
+
+    transporter.sendMail(mailOptions, (error, info) => {
+      if (error) {
         return res.status(500).json({
           status: false,
-          message: "Error hashing the password",
+          message: "Error sending email",
+          error: error.message,
         });
       }
 
-      // Update the user's password in the database
-      await User.update(
-        { password: hashedPassword },
-        {
-          where: {
-            email: user.email,
-          },
-        }
-      );
-
-      const mailOptions = {
-        from: `"DigiMe Support" <${emailConfig.gmail.user}>`, // Sender name & email
-        to: email, // Receiver email
-        subject: "DigiMe: Password Reset",
-        html: `
-          <div style="font-family: Arial, sans-serif; line-height: 1.6; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
-            <h2 style="color: #333;">Password Reset Request</h2>
-            <p>Hello,</p>
-            <p>We received a request to reset your password. Here is your new password:</p>
-            <p style="font-size: 18px; font-weight: bold; color: #007bff;">${newPassword}</p>
-            <p>Please log in and change your password immediately for security purposes.</p>
-            <p>If you did not request this change, please ignore this email or contact our support.</p>
-            <hr style="border: none; border-top: 1px solid #ddd;">
-            <p style="font-size: 12px; color: #888;">This is an automated email, please do not reply.</p>
-          </div>
-        `,
-      };
-
-      transporter.sendMail(mailOptions, (error, info) => {
-        if (error) {
-          return res.status(500).json({
-            status: false,
-            message: "Error sending email",
-            error: error.message,
-          });
-        }
-
-        res.json({
-          status: true,
-          message: "New password has been sent to your email.",
-        });
+      res.json({
+        status: true,
+        message: "New password has been sent to your email.",
       });
     });
   } catch (error) {
@@ -185,101 +188,98 @@ if (!User) {
 }
 
 Users.use(cors());
-Users.post("/register", (req, res) => {
-  const today = new Date();
-  const userData = {
-    first_name: req.body.first_name,
-    last_name: req.body.last_name,
-    email: req.body.email,
-    password: req.body.password,
-    created: today,
-  };
+Users.post("/register", async (req, res) => {
+  try {
+    const today = new Date();
+    const { first_name, last_name, email, password } = req.body;
 
-  // Generate profile URL
-  let baseProfileURL = generateSlug(`${req.body.first_name}`);
-  console.log(baseProfileURL);
-  // Check if Profile URL is unique
-  let GProfileURL = baseProfileURL;
-  let counter = Math.floor(Math.random() * 9) + 2;
-  // Verify User Profile URL
-    User.findOne({
-      where: {
+    // Generate profile URL
+    let baseProfileURL = generateSlug(first_name);
+    let GProfileURL = baseProfileURL;
+    let counter = Math.floor(Math.random() * 9) + 2;
+
+    // Check if profile URL exists
+    const { data: existingUrl } = await supabase
+      .from('users')
+      .select('user_profile_url')
+      .eq('user_profile_url', GProfileURL)
+      .single();
+
+    if (existingUrl) {
+      GProfileURL = `${baseProfileURL}-${counter}`;
+    }
+
+    // Check if email exists
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('email')
+      .eq('email', email)
+      .single();
+
+    if (existingUser) {
+      return res.json({ error: "User already exists" });
+    }
+
+    // Hash password and create user
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const { data: newUser, error } = await supabase
+      .from('users')
+      .insert([{
+        first_name,
+        last_name,
+        email,
+        password: hashedPassword,
         user_profile_url: GProfileURL,
-      },
-    })
-      .then((user_profile_url) => {
-          if (user_profile_url) {
-            GProfileURL = `${baseProfileURL}-${counter}`;
-            } else {
-            GProfileURL = `${baseProfileURL}`;
-          }
-      })
-    .catch((err) => {
-      res.send("error: " + err);
-    });
-  // Verify Email Address
-  User.findOne({
-    where: {
-      email: req.body.email,
-    },
-  })
-    //TODO bcrypt
-    .then((user) => {
-      if (!user) {
-        bcrypt.hash(req.body.password, 10, (err, hash) => {
-          userData.password = hash;
-          userData.user_profile_url = GProfileURL;
-          User.create(userData)
-            .then((user) => {
-              res.json({ status: user.email + "Registered!" });
-            })
-            .catch((err) => {
-              res.send("error: " + err);
-            });
-        });
-      } else {
-        res.json({ error: "User already exists" });
-      }
-    })
-    .catch((err) => {
-      res.send("error: " + err);
-    });
+        created: today
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ status: `${email} Registered!` });
+  } catch (error) {
+    console.error("Registration Error:", error);
+    res.status(500).json({ error: "Registration failed" });
+  }
 });
 
-Users.post("/login", (req, res) => {
-  User.findOne({
-    where: {
-      email: req.body.email,
-    },
-  })
-    .then((user) => {
-      if (user) {
-        if (bcrypt.compareSync(req.body.password, user.password)) {
-          let token = jwt.sign(user.dataValues, SECRET_KEY, {
-            expiresIn: 1440,
-          });
-          res.json(token);
-        } else {
-          res.status(401).json({ 
-            status: false,
-            message: "Invalid password" 
-          });
-        }
-      } else {
-        res.status(400).json({ 
-          status: false,
-          message: "User does not exist" 
-        });
-      }
-    })
-    .catch((err) => {
-      console.log(err);
-      res.status(400).json({ 
+Users.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (error || !user) {
+      return res.status(400).json({
         status: false,
-        message: "Login failed",
-        error: err.message 
+        message: "User does not exist"
       });
+    }
+
+    if (await bcrypt.compare(password, user.password)) {
+      let token = jwt.sign(user, SECRET_KEY, {
+        expiresIn: 1440
+      });
+      res.json(token);
+    } else {
+      res.status(401).json({
+        status: false,
+        message: "Invalid password"
+      });
+    }
+  } catch (error) {
+    console.error("Login Error:", error);
+    res.status(500).json({
+      status: false,
+      message: "Login failed",
+      error: error.message
     });
+  }
 });
 
 // Reset Password Route
@@ -304,7 +304,11 @@ Users.post("/resetpassword", verifyToken, async (req, res) => {
     const userId = decoded.id;
 
     // Find User by ID
-    const user = await User.findOne({ where: { id: userId } });
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', userId)
+      .single();
     if (!user) {
       return res.status(404).json({ status: false, message: "User not found" });
     }
@@ -313,10 +317,20 @@ Users.post("/resetpassword", verifyToken, async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     // Update password
-    await User.update(
-      { password: hashedPassword },
-      { where: { id: userId } }
-    );
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update({ password: hashedPassword })
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({
+        status: false,
+        message: "Internal server error",
+        error: updateError.message,
+      });
+    }
 
     return res.json({ status: true, message: "Password updated successfully" });
 
